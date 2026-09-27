@@ -21,14 +21,13 @@ go build -o usbformat .
 ./usbformat --self-test   # no display or root needed
 ```
 
-Or install it, which puts the binary in `$(go env GOPATH)/bin`:
+Or install it. Needs GTK4 headers, since the bindings are cgo:
 
 ```sh
 go install github.com/spaciousejar/usbformat@latest
 ```
 
-Private repo, so that needs your credentials. Run `gh auth setup-git` once if
-you have not already. Anyone else needs the repo flipped to public.
+That puts the binary in `$(go env GOPATH)/bin`, so add that to your `PATH`.
 
 ## Runtime tools
 
