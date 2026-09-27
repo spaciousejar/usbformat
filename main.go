@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
@@ -124,32 +125,38 @@ func rowText(d disk) (title, sub string) {
 	return title, strings.Join(parts, "  \u00b7  ")
 }
 
-// partitions returns dev plus every partition on it, from lsblk JSON.
+// probe returns dev's own size in bytes and every partition on it, from lsblk
+// JSON. One read serves both the identity check and the unmount list.
 //
 // The lsblk call needs a /dev/ path, not a bare name: given "sdc" it exits
 // non-zero with no children, so the partitions are never discovered, never
 // unmounted, and mkfs then fails with "device or resource busy" whenever the
 // stick already carries a mounted partition. That only shows up on sticks that
 // arrive partitioned, which is most of them in the wild.
-func partitions(dev, lsblkJSON string) []string {
+func probe(dev, lsblkJSON string) (int64, []string) {
 	parts := []string{dev}
 	var r struct {
 		Blockdevices []struct {
 			Name     string `json:"name"`
+			Size     int64  `json:"size"`
 			Children []struct {
 				Name string `json:"name"`
 			} `json:"children"`
 		} `json:"blockdevices"`
 	}
 	if json.Unmarshal([]byte(lsblkJSON), &r) != nil {
-		return parts
+		return 0, parts
 	}
+	var size int64
 	for _, d := range r.Blockdevices {
+		if d.Name == dev {
+			size = d.Size
+		}
 		for _, c := range d.Children {
 			parts = append(parts, c.Name)
 		}
 	}
-	return parts
+	return size, parts
 }
 
 // firstPart is the name of a disk's first partition. sd* takes a bare digit
@@ -157,6 +164,9 @@ func partitions(dev, lsblkJSON string) []string {
 // already ends in a digit. The filter does not reject those: an NVMe SSD in a
 // USB enclosure reports tran=usb, so it lands here like any other stick.
 func firstPart(dev string) string {
+	if dev == "" {
+		return ""
+	}
 	if c := dev[len(dev)-1]; c >= '0' && c <= '9' {
 		return dev + "p1"
 	}
@@ -175,7 +185,13 @@ func lookup(key string) (fsDef, bool) {
 // doFormat runs as root, returning the message to show the user and whether it
 // worked. Both are needed: the success message is non-empty too, so the caller
 // cannot read failure off an empty string.
-func doFormat(dev, fsKey string) (string, bool) {
+//
+// wantSize is the size the user was shown, or 0 to skip the identity check. The
+// check lives here rather than in the GUI on purpose: this runs adjacent to
+// parted, so the window in which the name could be reused by other hardware is
+// microseconds. Checking in the GUI instead would leave a gap the whole width of
+// pkexec startup -- password prompt, polkit, exec.
+func doFormat(dev, fsKey string, wantSize int64) (string, bool) {
 	if os.Geteuid() != 0 {
 		return "must run as root (the GUI relaunches this via pkexec)", false
 	}
@@ -185,10 +201,22 @@ func doFormat(dev, fsKey string) (string, bool) {
 	if !ok {
 		return "unknown filesystem " + fsKey, false
 	}
+	if dev == "" {
+		return "no device named", false
+	}
 	// Only the disk itself. A bare name here makes lsblk fail, which silently
-	// hides the partitions we most need to unmount.
-	_, out := run("lsblk", "-J", "-o", "NAME", "/dev/"+dev)
-	parts := partitions(dev, out)
+	// hides the partitions we most need to unmount. -b matters too: without it
+	// SIZE is the string "57.8G", which does not unmarshal into an int64 and
+	// would make every erase refuse.
+	_, out := run("lsblk", "-J", "-b", "-o", "NAME,SIZE", "/dev/"+dev)
+	size, parts := probe(dev, out)
+	if size == 0 {
+		return fmt.Sprintf("/dev/%s is not there any more. Nothing was erased.", dev), false
+	}
+	if wantSize > 0 && size != wantSize {
+		return fmt.Sprintf("/dev/%s is %s, not the %s you confirmed. Nothing was erased.",
+			dev, human(size), human(wantSize)), false
+	}
 	for _, p := range parts {
 		if code, out := run("umount", "/dev/"+p); code != 0 && !strings.Contains(out, "not mounted") {
 			return fmt.Sprintf("could not unmount /dev/%s: %s", p, out), false
@@ -400,46 +428,15 @@ func (u *ui) format() {
 		return
 	}
 
-	// The name alone is not an identity: unplug the stick while this dialog is
-	// up and the kernel can hand /dev/sdc to something else. Re-read and
-	// compare against what the user was actually shown.
-	want := d
+	// A device name is not an identity: unplug the stick while this dialog is
+	// up and the kernel can hand /dev/sdc to other hardware. Pass the size that
+	// was on screen so the root side can refuse, next to parted, rather than
+	// trusting a name captured seconds ago.
 	u.dialog("Erase drive?", confirmText(d, f), []string{"Cancel", "Erase"}, 1, func(i int) {
-		if i != 1 {
-			return
+		if i == 1 {
+			u.startFormat(d, f.key)
 		}
-		if msg := changedSince(want); msg != "" {
-			u.dialog("Drive changed", msg, []string{"OK"}, -1, nil)
-			u.refresh("")
-			return
-		}
-		u.startFormat(d.Name, f.key)
 	})
-}
-
-// changedSince re-reads the drive and reports a problem if it is no longer the
-// one the user confirmed. Size and model are what the dialog displayed, so a
-// mismatch means the name now belongs to different hardware.
-//
-// This narrows the window from "the whole time the dialog was open" to "between
-// this check and mkfs", which is a few milliseconds of pkexec startup. Closing
-// it completely needs a udev watch on the device, which is more machinery than
-// this is worth for a check the user also has to answer with a click.
-func changedSince(want disk) string {
-	now, err := disks()
-	if err != nil {
-		return "Could not check the drive before erasing: " + err.Error()
-	}
-	for _, d := range now {
-		if d.Name == want.Name {
-			if d.Size != want.Size {
-				return fmt.Sprintf("/dev/%s is now %s, not the %s you were asked about. Nothing was erased.",
-					d.Name, human(d.Size), human(want.Size))
-			}
-			return ""
-		}
-	}
-	return fmt.Sprintf("/dev/%s is gone. Nothing was erased.", want.Name)
 }
 
 func confirmText(d disk, f fsDef) string {
@@ -481,12 +478,13 @@ func mount(part string) (string, error) {
 // startFormat hands the work to pkexec on a goroutine. It used to run inline,
 // which blocked the main loop: the window froze behind the auth prompt and for
 // the whole of mkfs, and looked hung.
-func (u *ui) startFormat(dev, fsKey string) {
+func (u *ui) startFormat(d disk, fsKey string) {
 	self, _ := os.Executable()
+	dev := d.Name
 	u.say("asking for admin rights to format /dev/" + dev + " as " + fsKey + "...")
 	u.setBusy(true)
 	go func() {
-		code, out := run("pkexec", self, "--format", dev, fsKey)
+		code, out := run("pkexec", self, "--format", dev, fsKey, fmt.Sprint(d.Size))
 		if out == "" {
 			out = fmt.Sprintf("failed (exit %d)", code)
 		}
@@ -732,7 +730,7 @@ func selfTest() {
 	// format exited 1 and the GUI read that as a failure. Both the name and the
 	// filesystem here are bogus, so this cannot touch a real drive even if the
 	// self-test is run as root.
-	if msg, ok := doFormat("nosuchdev", "nosuchfs"); ok || msg == "" {
+	if msg, ok := doFormat("nosuchdev", "nosuchfs", 0); ok || msg == "" {
 		fmt.Fprintf(os.Stderr, "doFormat: got %q, %v; want a message and ok=false\n", msg, ok)
 		os.Exit(1)
 	}
@@ -741,15 +739,24 @@ func selfTest() {
 	// The unmount list is the difference between a working erase and
 	// "device or resource busy", and the failure is invisible unless lsblk is
 	// given a /dev/ path. Feed it the real shape of a partitioned stick.
-	const partitioned = `{"blockdevices":[{"name":"sdc","children":[{"name":"sdc1"},{"name":"sdc2"}]}]}`
-	if got := strings.Join(partitions("sdc", partitioned), " "); got != "sdc sdc1 sdc2" {
-		fmt.Fprintf(os.Stderr, "partitions: got %q, want %q\n", got, "sdc sdc1 sdc2")
+	const partitioned = `{"blockdevices":[{"name":"sdc","size":62026416128,"children":[{"name":"sdc1"},{"name":"sdc2"}]}]}`
+	size, got := probe("sdc", partitioned)
+	if got := strings.Join(got, " "); got != "sdc sdc1 sdc2" {
+		fmt.Fprintf(os.Stderr, "probe parts: got %q, want %q\n", got, "sdc sdc1 sdc2")
 		os.Exit(1)
 	}
-	// What lsblk prints for a bare name: no children. Must still be usable.
-	const bareName = `{"blockdevices":[]}`
-	if got := strings.Join(partitions("sdc", bareName), " "); got != "sdc" {
-		fmt.Fprintf(os.Stderr, "partitions empty: got %q, want %q\n", got, "sdc")
+	// The same read supplies the size that the root-side identity check
+	// compares against, so a wrong value here would silently disable it. Note
+	// the numeric size: lsblk without -b emits "57.8G", which does not
+	// unmarshal into an int64 and makes every erase refuse.
+	if size != 62026416128 {
+		fmt.Fprintf(os.Stderr, "probe size: got %d, want %d\n", size, 62026416128)
+		os.Exit(1)
+	}
+	// What lsblk prints for a bare name, or for a drive that is gone: no size,
+	// which is how the root side tells "not there" from "changed".
+	if size, got := probe("sdc", `{"blockdevices":[]}`); size != 0 || strings.Join(got, " ") != "sdc" {
+		fmt.Fprintf(os.Stderr, "probe gone: got %d / %q, want 0 / sdc\n", size, strings.Join(got, " "))
 		os.Exit(1)
 	}
 	// The filesystem goes on the partition, and the mount has to follow it there
@@ -788,7 +795,14 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--format" {
-		msg, ok := doFormat(os.Args[2], os.Args[3])
+		// The size is optional so a hand-typed erase still works, but the GUI
+		// always passes it, and with it the drive is checked against what the
+		// user actually saw.
+		var want int64
+		if len(os.Args) > 4 {
+			want, _ = strconv.ParseInt(os.Args[4], 10, 64)
+		}
+		msg, ok := doFormat(os.Args[2], os.Args[3], want)
 		fmt.Println(msg)
 		if !ok {
 			os.Exit(1)

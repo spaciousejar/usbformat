@@ -53,7 +53,9 @@ format only, then mounts the result as you and posts a notification.
 
 ```
 ./usbformat                      GUI, runs as you
-  └─ pkexec ./usbformat --format sdc fat32     the only root part
+  └─ pkexec ./usbformat --format sdc fat32 62026416128
+       │                                       └ the size you confirmed
+       ├─ lsblk, refuse if the size is not that   the name alone is not identity
        ├─ umount        the drive and any partitions on it
        ├─ parted mklabel msdos                 drops the stale GPT/MBR
        ├─ parted mkpart primary 1MiB 100%     one partition, the whole device
@@ -76,6 +78,11 @@ partitions, so a whole-device filesystem is invisible to both. Without it the
 - The erase button stays insensitive until a drive is selected, and controls
   disable while a format is running.
 - The password prompt is the polkit agent's, not a terminal.
+- `/dev/sdc` is a name, not an identity. Unplug the stick while the dialog is up
+  and the kernel can hand that name to other hardware, so the size shown on
+  screen is passed to the root side and re-checked against the live device
+  immediately before `parted` runs. Mismatch, or gone, and nothing is erased.
+  A hand-typed `--format sdc fat32` without the size skips that check.
 
 ## Notes
 
