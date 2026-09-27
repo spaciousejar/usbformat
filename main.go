@@ -29,7 +29,7 @@ type fsDef struct {
 var formats = []fsDef{
 	{"exfat - Windows, macOS, Linux", "exfat", "exfatprogs", []string{"mkfs.exfat"}},
 	{"fat32 - universal, max 32 GB", "vfat", "dosfstools", []string{"mkfs.vfat", "-F", "32"}},
-	{"ext4 - Linux only", "ext4", "", []string{"mkfs.ext4", "-q"}},
+	{"ext4 - Linux only", "ext4", "e2fsprogs", []string{"mkfs.ext4", "-q"}},
 }
 
 var banned = []string{"sr", "loop", "ram", "zram", "fd"}
@@ -152,11 +152,25 @@ func partitions(dev, lsblkJSON string) []string {
 	return parts
 }
 
-// firstPart is the name of a disk's first partition. Everything this app can
-// list is a USB stick, which the kernel exposes as /dev/sdX, so the first
-// partition is <name>1. Internal NVMe and mmc want a "p" there, but the filter
-// rejects both, so do not carry the branch.
-func firstPart(dev string) string { return dev + "1" }
+// firstPart is the name of a disk's first partition. sd* takes a bare digit
+// (sdc1), but nvme* and mmcblk* insert a "p" (nvme0n1p1) because the name
+// already ends in a digit. The filter does not reject those: an NVMe SSD in a
+// USB enclosure reports tran=usb, so it lands here like any other stick.
+func firstPart(dev string) string {
+	if c := dev[len(dev)-1]; c >= '0' && c <= '9' {
+		return dev + "p1"
+	}
+	return dev + "1"
+}
+
+func lookup(key string) (fsDef, bool) {
+	for _, f := range formats {
+		if f.key == key {
+			return f, true
+		}
+	}
+	return fsDef{}, false
+}
 
 // doFormat runs as root, returning the message to show the user and whether it
 // worked. Both are needed: the success message is non-empty too, so the caller
@@ -164,6 +178,12 @@ func firstPart(dev string) string { return dev + "1" }
 func doFormat(dev, fsKey string) (string, bool) {
 	if os.Geteuid() != 0 {
 		return "must run as root (the GUI relaunches this via pkexec)", false
+	}
+	// Before anything destructive. A typo here used to reach parted, wipe the
+	// partition table, and only then fail to find a filesystem to write.
+	f, ok := lookup(fsKey)
+	if !ok {
+		return "unknown filesystem " + fsKey, false
 	}
 	// Only the disk itself. A bare name here makes lsblk fail, which silently
 	// hides the partitions we most need to unmount.
@@ -192,16 +212,11 @@ func doFormat(dev, fsKey string) (string, bool) {
 	run("partprobe", "/dev/"+dev)
 	run("udevadm", "settle")
 	part := firstPart(dev)
-	for _, f := range formats {
-		if f.key == fsKey {
-			code, out := run(f.argv[0], append(f.argv[1:], "/dev/"+part)...)
-			if code != 0 {
-				return out, false
-			}
-			return fmt.Sprintf("formatted /dev/%s as %s", part, fsKey), true
-		}
+	code, out := run(f.argv[0], append(f.argv[1:], "/dev/"+part)...)
+	if code != 0 {
+		return out, false
 	}
-	return "unknown filesystem " + fsKey, false
+	return fmt.Sprintf("formatted /dev/%s as %s", part, fsKey), true
 }
 
 // Adwaita already ships boxed-list, destructive-action, dim-label, title-*,
@@ -385,11 +400,46 @@ func (u *ui) format() {
 		return
 	}
 
+	// The name alone is not an identity: unplug the stick while this dialog is
+	// up and the kernel can hand /dev/sdc to something else. Re-read and
+	// compare against what the user was actually shown.
+	want := d
 	u.dialog("Erase drive?", confirmText(d, f), []string{"Cancel", "Erase"}, 1, func(i int) {
-		if i == 1 {
-			u.startFormat(d.Name, f.key)
+		if i != 1 {
+			return
 		}
+		if msg := changedSince(want); msg != "" {
+			u.dialog("Drive changed", msg, []string{"OK"}, -1, nil)
+			u.refresh("")
+			return
+		}
+		u.startFormat(d.Name, f.key)
 	})
+}
+
+// changedSince re-reads the drive and reports a problem if it is no longer the
+// one the user confirmed. Size and model are what the dialog displayed, so a
+// mismatch means the name now belongs to different hardware.
+//
+// This narrows the window from "the whole time the dialog was open" to "between
+// this check and mkfs", which is a few milliseconds of pkexec startup. Closing
+// it completely needs a udev watch on the device, which is more machinery than
+// this is worth for a check the user also has to answer with a click.
+func changedSince(want disk) string {
+	now, err := disks()
+	if err != nil {
+		return "Could not check the drive before erasing: " + err.Error()
+	}
+	for _, d := range now {
+		if d.Name == want.Name {
+			if d.Size != want.Size {
+				return fmt.Sprintf("/dev/%s is now %s, not the %s you were asked about. Nothing was erased.",
+					d.Name, human(d.Size), human(want.Size))
+			}
+			return ""
+		}
+	}
+	return fmt.Sprintf("/dev/%s is gone. Nothing was erased.", want.Name)
 }
 
 func confirmText(d disk, f fsDef) string {
@@ -703,10 +753,31 @@ func selfTest() {
 		os.Exit(1)
 	}
 	// The filesystem goes on the partition, and the mount has to follow it there
-	// or the freshly erased drive comes back looking empty.
-	if firstPart("sdc") != "sdc1" {
-		fmt.Fprintf(os.Stderr, "firstPart: got %q, want %q\n", firstPart("sdc"), "sdc1")
+	// or the freshly erased drive comes back looking empty. sd* takes a bare
+	// digit, but an NVMe SSD in a USB enclosure passes the filter and its name
+	// already ends in a digit, so it needs the p.
+	for _, c := range []struct{ dev, want string }{
+		{"sdc", "sdc1"}, {"sdz", "sdz1"},
+		{"nvme0n1", "nvme0n1p1"}, {"mmcblk0", "mmcblk0p1"},
+	} {
+		if got := firstPart(c.dev); got != c.want {
+			fmt.Fprintf(os.Stderr, "firstPart(%q) = %q, want %q\n", c.dev, got, c.want)
+			os.Exit(1)
+		}
+	}
+	if _, ok := lookup("nosuchfs"); ok {
+		fmt.Fprintln(os.Stderr, "lookup: nosuchfs should not resolve")
 		os.Exit(1)
+	}
+	for _, f := range formats {
+		if _, ok := lookup(f.key); !ok {
+			fmt.Fprintf(os.Stderr, "lookup: %q does not resolve\n", f.key)
+			os.Exit(1)
+		}
+		if f.pkg == "" {
+			fmt.Fprintf(os.Stderr, "%s: no package name, so the install hint is empty\n", f.key)
+			os.Exit(1)
+		}
 	}
 	fmt.Println("ok")
 }
