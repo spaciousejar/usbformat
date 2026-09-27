@@ -13,13 +13,22 @@ signal that a disk is a stick.
 Needs GTK4 and its development headers, because the bindings are cgo.
 
 ```sh
-go build -o usbformat .
-./usbformat
+go build -o useformat .
+./useformat
 ```
 
 ```sh
-./usbformat --self-test   # no display or root needed
+./useformat --self-test   # no display or root needed
 ```
+
+Or install it:
+
+```sh
+go install github.com/spaciousejar/useformat@latest
+```
+
+The module path and the repository name differ on purpose, which means that
+command does not resolve. Rename one of them and it will.
 
 ## Runtime tools
 
