@@ -1,4 +1,4 @@
-module usbformat
+module github.com/spaciousejar/usbformat
 
 go 1.27.1
 
