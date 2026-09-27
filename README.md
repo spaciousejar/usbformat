@@ -13,22 +13,22 @@ signal that a disk is a stick.
 Needs GTK4 and its development headers, because the bindings are cgo.
 
 ```sh
-go build -o useformat .
-./useformat
+go build -o usbformat .
+./usbformat
 ```
 
 ```sh
-./useformat --self-test   # no display or root needed
+./usbformat --self-test   # no display or root needed
 ```
 
-Or install it:
+Or install it, which puts the binary in `$(go env GOPATH)/bin`:
 
 ```sh
-go install github.com/spaciousejar/useformat@latest
+go install github.com/spaciousejar/usbformat@latest
 ```
 
-The module path and the repository name differ on purpose, which means that
-command does not resolve. Rename one of them and it will.
+Private repo, so that needs your credentials. Run `gh auth setup-git` once if
+you have not already. Anyone else needs the repo flipped to public.
 
 ## Runtime tools
 
